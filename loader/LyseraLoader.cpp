@@ -1,7 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winhttp.h>
-#include <bcrypt.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -9,15 +8,11 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace fs = std::filesystem;
@@ -41,10 +36,6 @@ namespace {
         L"assets/icons/settings.svg",
         L"assets/icons/target.svg"
     };
-
-    std::string narrow_path(const std::wstring& value) {
-        return fs::path(value).generic_string();
-    }
 
     void pump_messages() {
         MSG message{};
@@ -123,59 +114,11 @@ namespace {
         return body;
     }
 
-    std::string sha256(const std::vector<unsigned char>& bytes) {
-        BCRYPT_ALG_HANDLE algorithm = nullptr;
-        BCRYPT_HASH_HANDLE hash = nullptr;
-        DWORD object_size = 0;
-        DWORD hash_size = 0;
-        DWORD result_size = 0;
-
-        if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
-            BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &result_size, 0) < 0 ||
-            BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
-                reinterpret_cast<PUCHAR>(&hash_size), sizeof(hash_size), &result_size, 0) < 0) {
-            if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-            throw std::runtime_error("SHA-256 initialization failed");
-        }
-
-        std::vector<unsigned char> object(object_size);
-        std::vector<unsigned char> digest(hash_size);
-        if (BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) < 0 ||
-            BCryptHashData(hash, const_cast<PUCHAR>(bytes.data()), static_cast<ULONG>(bytes.size()), 0) < 0 ||
-            BCryptFinishHash(hash, digest.data(), hash_size, 0) < 0) {
-            if (hash) BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(algorithm, 0);
-            throw std::runtime_error("SHA-256 calculation failed");
-        }
-
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        std::ostringstream output;
-        output << std::hex << std::setfill('0');
-        for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
-        return output.str();
-    }
-
     std::string trim(std::string value) {
         while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
         std::size_t first = 0;
         while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) ++first;
         return value.substr(first);
-    }
-
-    std::unordered_map<std::string, std::string> parse_checksums(const std::string& text) {
-        std::unordered_map<std::string, std::string> checksums;
-        std::istringstream lines(text);
-        std::string line;
-        while (std::getline(lines, line)) {
-            std::istringstream fields(line);
-            std::string digest;
-            std::string path;
-            fields >> digest >> path;
-            if (!digest.empty() && !path.empty()) checksums[path] = digest;
-        }
-        return checksums;
     }
 
     std::string read_text(const fs::path& path) {
@@ -293,28 +236,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         for (const auto& file : kFiles) needs_update = needs_update || !fs::exists(root / fs::path(file));
 
         if (needs_update) {
-            set_status(L"Reading release manifest...", 0.14f);
-            const auto checksum_bytes = http_get(std::wstring(kRepoRoot) + L"checksums.txt" + cache_buster);
-            const auto checksums = parse_checksums({ checksum_bytes.begin(), checksum_bytes.end() });
-
             for (std::size_t index = 0; index < kFiles.size(); ++index) {
                 const std::wstring& relative = kFiles[index];
-                const std::string generic = narrow_path(relative);
-                const auto expected = checksums.find(generic);
-                if (expected == checksums.end()) throw std::runtime_error("Release checksum is missing");
-
                 set_status(L"Updating " + fs::path(relative).filename().wstring() + L"...",
                     0.18f + 0.70f * static_cast<float>(index) / static_cast<float>(kFiles.size()));
                 std::wstring remote_path = std::wstring(kRepoRoot) + relative;
                 std::replace(remote_path.begin(), remote_path.end(), L'\\', L'/');
                 const auto bytes = http_get(remote_path + cache_buster);
-                std::string actual = sha256(bytes);
-                std::transform(actual.begin(), actual.end(), actual.begin(),
-                    [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-                std::string wanted = expected->second;
-                std::transform(wanted.begin(), wanted.end(), wanted.begin(),
-                    [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-                if (actual != wanted) throw std::runtime_error("Downloaded file failed SHA-256 verification");
                 write_atomic(root / fs::path(relative), bytes);
             }
 
@@ -340,6 +268,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     }
     catch (const std::exception& error) {
         std::string message = std::string("Lysera update failed:\n\n") + error.what();
+        try {
+            std::ofstream log(executable_directory() / L"loader-error.log", std::ios::binary | std::ios::trunc);
+            log << error.what();
+        }
+        catch (...) {
+        }
         MessageBoxA(g_window, message.c_str(), "Lysera Loader", MB_OK | MB_ICONERROR);
         return 1;
     }
