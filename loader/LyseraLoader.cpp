@@ -27,7 +27,7 @@ namespace {
     float g_progress = 0.0f;
 
     const std::array<std::wstring, 8> kFiles = {
-        L"Lysera.exe",
+        L"bin/Lysera.exe",
         L"assets/fonts/Inter-Medium.ttf",
         L"assets/fonts/Inter-Regular.ttf",
         L"assets/fonts/Inter-SemiBold.ttf",
@@ -150,6 +150,39 @@ namespace {
         return fs::path(path).parent_path();
     }
 
+    fs::path install_root() {
+        const DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+        if (required == 0) throw std::runtime_error("LOCALAPPDATA is unavailable");
+        std::vector<wchar_t> value(required);
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", value.data(), required) == 0)
+            throw std::runtime_error("LOCALAPPDATA could not be read");
+        return fs::path(value.data()) / L"Lysera_data";
+    }
+
+    void migrate_persistent_data(const fs::path& old_root, const fs::path& root) {
+        if (old_root == root) return;
+        for (const wchar_t* folder : { L"config", L"cache" }) {
+            const fs::path source = old_root / L"data" / folder;
+            const fs::path destination = root / L"data" / folder;
+            if (!fs::exists(source)) continue;
+            std::error_code error;
+            fs::create_directories(destination, error);
+            error.clear();
+            fs::copy(source, destination,
+                fs::copy_options::recursive | fs::copy_options::skip_existing, error);
+        }
+    }
+
+    void clear_managed_files(const fs::path& root) {
+        for (const wchar_t* folder : { L"bin", L"assets" }) {
+            std::error_code error;
+            fs::remove_all(root / folder, error);
+            if (error) throw std::runtime_error("Unable to clean old runtime files");
+        }
+        std::error_code error;
+        fs::remove(root / L"Lysera.exe", error);
+    }
+
     LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         if (message == WM_NCHITTEST) return HTCAPTION;
         if (message == WM_CLOSE) { DestroyWindow(window); return 0; }
@@ -222,9 +255,11 @@ namespace {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     try {
         create_window(instance);
-        const fs::path root = executable_directory();
+        const fs::path root = install_root();
+        fs::create_directories(root / L"data" / L"config");
+        fs::create_directories(root / L"data" / L"cache");
+        migrate_persistent_data(executable_directory(), root);
         const fs::path version_cache = root / L"data" / L"cache" / L"loader.version";
-        fs::create_directories(version_cache.parent_path());
 
         set_status(L"Checking for updates...", 0.08f);
         const std::wstring cache_buster = L"?v=" + std::to_wstring(GetTickCount64());
@@ -236,6 +271,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         for (const auto& file : kFiles) needs_update = needs_update || !fs::exists(root / fs::path(file));
 
         if (needs_update) {
+            clear_managed_files(root);
             for (std::size_t index = 0; index < kFiles.size(); ++index) {
                 const std::wstring& relative = kFiles[index];
                 set_status(L"Updating " + fs::path(relative).filename().wstring() + L"...",
@@ -258,7 +294,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
         }
 
         set_status(needs_update ? L"Update complete. Launching..." : L"Up to date. Launching...", 1.0f);
-        const fs::path application = root / L"Lysera.exe";
+        const fs::path application = root / L"bin" / L"Lysera.exe";
         const HINSTANCE launched = ShellExecuteW(nullptr, L"runas", application.c_str(), nullptr,
             root.c_str(), SW_SHOWNORMAL);
         if (reinterpret_cast<INT_PTR>(launched) <= 32)
@@ -269,7 +305,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     catch (const std::exception& error) {
         std::string message = std::string("Lysera update failed:\n\n") + error.what();
         try {
-            std::ofstream log(executable_directory() / L"loader-error.log", std::ios::binary | std::ios::trunc);
+            const fs::path log_directory = install_root();
+            fs::create_directories(log_directory);
+            std::ofstream log(log_directory / L"loader-error.log", std::ios::binary | std::ios::trunc);
             log << error.what();
         }
         catch (...) {
