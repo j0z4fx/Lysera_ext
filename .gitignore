@@ -1,0 +1,6 @@
+.vs/
+loader/x64/
+*.user
+*.pdb
+*.ipdb
+*.iobj
